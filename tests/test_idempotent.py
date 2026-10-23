@@ -158,11 +158,11 @@ class WriteTests(unittest.TestCase):
                          plugin._turn_doc_id("s", self.user, self.answer))
 
 
-class SelectiveFactsTests(WriteTests):
+class SelectiveFactsTests(unittest.TestCase):
     """Exercise opt-in behavior using fake Ollama; no network or prod data."""
 
     def setUp(self):
-        super().setUp()
+        WriteTests.setUp(self)
         self.p._config["memory_write_mode"] = "facts"
         self.p._config["extraction_model"] = "qwen3.5:9b"
         self.orig_extract = plugin._ollama_extract_fact
@@ -174,7 +174,9 @@ class SelectiveFactsTests(WriteTests):
 
     def tearDown(self):
         plugin._ollama_extract_fact = self.orig_extract
-        super().tearDown()
+        WriteTests.tearDown(self)
+
+    store = WriteTests.store
 
     def test_facts_mode_stores_compact_fact_not_answer(self):
         self.assertTrue(self.store())
