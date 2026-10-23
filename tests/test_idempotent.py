@@ -181,7 +181,8 @@ class NativeApiTests(unittest.TestCase):
                     user = "Project Copper Lantern uses MariaDB and NATS"
                     assistant = "Confirmed four Kubernetes worker nodes"
                     expected_id = plugin._turn_doc_id("session-test", user, assistant)
-                    self.assertEqual(len(expected_id), 72)
+                    self.assertEqual(len(expected_id), 64)
+                    self.assertTrue(all(c in "0123456789abcdef" for c in expected_id))
                     self.assertTrue(p._write_turn_once(
                         user_content=user, assistant_content=assistant,
                         sid="session-test", role="turn", ts=1000.0, meta="{}", coll=coll))

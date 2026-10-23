@@ -268,7 +268,7 @@ def _canonical_turn(user_content, assistant_content):
 def _turn_doc_id(session_id, user, assistant):
     """Deterministic, versioned ID scoped to session and canonical turn content."""
     payload = json.dumps([session_id, user, assistant], ensure_ascii=False, separators=(",", ":"))
-    return "turn-v1-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ============================================================================
