@@ -159,6 +159,42 @@ class WriteTests(unittest.TestCase):
 
 
 class NativeApiTests(unittest.TestCase):
+    def test_native_idempotent_write_with_full_sha256_id(self):
+        """Use real Zvec 0.6.0 to write the 72-char IDs used by the fork."""
+        try:
+            import zvec
+        except ImportError:
+            self.skipTest("requires zvec==0.6.0")
+        with tempfile.TemporaryDirectory() as tmp:
+            schema = plugin._build_memories_schema(vector_dim=3, collection_name="test_memories")
+            coll = zvec.create_and_open(str(Path(tmp) / "test_memories"), schema)
+            try:
+                p = object.__new__(plugin.ZvecMemoryProvider)
+                p._config = {"embedding_model": "nomic-embed-text", "min_content_len": 50,
+                             "enable_hnsw_optimize": False}
+                p._insert_lock = threading.Lock()
+                p._embedding_lock = threading.Lock()
+                p._writes_since_optimize = 0
+                original_embed = plugin._ollama_embed_single
+                try:
+                    plugin._ollama_embed_single = lambda *args: np.ones(3, dtype=np.float32)
+                    user = "Project Copper Lantern uses MariaDB and NATS"
+                    assistant = "Confirmed four Kubernetes worker nodes"
+                    expected_id = plugin._turn_doc_id("session-test", user, assistant)
+                    self.assertEqual(len(expected_id), 72)
+                    self.assertTrue(p._write_turn_once(
+                        user_content=user, assistant_content=assistant,
+                        sid="session-test", role="turn", ts=1000.0, meta="{}", coll=coll))
+                    self.assertIn(expected_id, coll.fetch(ids=expected_id, include_vector=False))
+                    self.assertFalse(p._write_turn_once(
+                        user_content=user, assistant_content=assistant,
+                        sid="session-test", role="session_end", ts=1000.0,
+                        meta="{}", coll=coll))
+                finally:
+                    plugin._ollama_embed_single = original_embed
+            finally:
+                del coll
+
     def test_zvec_06_native_status_and_fetch(self):
         try:
             import zvec
