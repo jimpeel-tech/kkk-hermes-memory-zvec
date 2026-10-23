@@ -143,6 +143,7 @@ class WriteTests(unittest.TestCase):
         self.assertEqual(len(self.coll.docs), 1)
 
     def test_prefetch_ignores_session_filter(self):
+        self.p._config["prefetch_mode"] = "vector"
         seen, event = [], threading.Event()
         def fake_search(query, top_k, session_id):
             seen.append(session_id)
@@ -213,6 +214,8 @@ class SelectiveFactsTests(unittest.TestCase):
             def raise_for_status(self): return None
             def json(self): return {"response": '{"memory": "User prefers Fish shell."}'}
         old_post = plugin.requests.post
+        previous_extractor = plugin._ollama_extract_fact
+        plugin._ollama_extract_fact = self.orig_extract
         seen = {}
         def fake_post(url, **kwargs):
             seen["url"] = url
@@ -228,6 +231,7 @@ class SelectiveFactsTests(unittest.TestCase):
             self.assertFalse(seen["payload"]["stream"])
         finally:
             plugin.requests.post = old_post
+            plugin._ollama_extract_fact = previous_extractor
 
     def test_session_end_selective_extraction_is_bounded(self):
         self.p._config["facts_session_end_max_turns"] = 2
