@@ -158,6 +158,91 @@ class WriteTests(unittest.TestCase):
                          plugin._turn_doc_id("s", self.user, self.answer))
 
 
+class SelectiveFactsTests(WriteTests):
+    """Exercise opt-in behavior using fake Ollama; no network or prod data."""
+
+    def setUp(self):
+        super().setUp()
+        self.p._config["memory_write_mode"] = "facts"
+        self.p._config["extraction_model"] = "qwen3.5:9b"
+        self.orig_extract = plugin._ollama_extract_fact
+        self.extractions = 0
+        def extract(user, *args, **kwargs):
+            self.extractions += 1
+            return "Project Silver Badger uses CockroachDB, RabbitMQ and five worker nodes."
+        plugin._ollama_extract_fact = extract
+
+    def tearDown(self):
+        plugin._ollama_extract_fact = self.orig_extract
+        super().tearDown()
+
+    def test_facts_mode_stores_compact_fact_not_answer(self):
+        self.assertTrue(self.store())
+        row = next(iter(self.coll.docs.values()))
+        self.assertEqual(row.fields["role"], "fact")
+        self.assertIn("Silver Badger", row.fields["content"])
+        self.assertNotIn("[assistant]", row.fields["content"])
+
+    def test_repeated_session_end_does_not_regenerate(self):
+        self.assertTrue(self.store(role="turn"))
+        self.assertFalse(self.store(role="session_end"))
+        self.assertEqual((len(self.coll.docs), self.extractions), (1, 1))
+
+    def test_different_assistant_content_is_same_user_fact(self):
+        self.assertTrue(self.store())
+        self.assertFalse(self.store(answer="Different assistant reply"))
+        self.assertEqual((len(self.coll.docs), self.extractions), (1, 1))
+
+    def test_empty_extraction_skips_write(self):
+        plugin._ollama_extract_fact = lambda *a, **k: ""
+        self.assertFalse(self.store())
+        self.assertEqual(len(self.coll.docs), 0)
+
+    def test_failed_extraction_logs_and_does_not_write_raw_turn(self):
+        def broken(*args, **kwargs):
+            raise RuntimeError("Ollama unavailable")
+        plugin._ollama_extract_fact = broken
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            self.store()
+        self.assertEqual(len(self.coll.docs), 0)
+
+    def test_selective_extractor_json_contract(self):
+        class FakeResponse:
+            def raise_for_status(self): return None
+            def json(self): return {"response": '{"memory": "User prefers Fish shell."}'}
+        old_post = plugin.requests.post
+        seen = {}
+        def fake_post(url, **kwargs):
+            seen["url"] = url
+            seen["payload"] = kwargs["json"]
+            return FakeResponse()
+        try:
+            plugin.requests.post = fake_post
+            fact = plugin._ollama_extract_fact(
+                "I prefer Fish for commands", "http://localhost:11434", "qwen3.5:9b")
+            self.assertEqual(fact, "User prefers Fish shell.")
+            self.assertTrue(seen["url"].endswith("/api/generate"))
+            self.assertEqual(seen["payload"]["format"], "json")
+            self.assertFalse(seen["payload"]["stream"])
+        finally:
+            plugin.requests.post = old_post
+
+    def test_prefetch_hybrid_and_vector_fallback(self):
+        self.p._config["prefetch_top_k"] = 5
+        seen = []
+        def hybrid(query, top_k, session_id):
+            seen.append(("hybrid", top_k, session_id))
+            return []
+        def vector(query, top_k, session_id):
+            seen.append(("vector", top_k, session_id))
+            return [{"content": "Silver Badger", "score": 0.91}]
+        self.p._do_hybrid_search = hybrid
+        self.p._do_search = vector
+        result = self.p.prefetch("Silver Badger?", session_id="new-session")
+        self.assertIn("Silver Badger", result)
+        self.assertEqual(seen, [("hybrid", 5, ""), ("vector", 5, "")])
+
+
 class NativeApiTests(unittest.TestCase):
     def test_native_idempotent_write_with_full_sha256_id(self):
         """Use real Zvec 0.6.0 to write the 72-char IDs used by the fork."""
@@ -193,6 +278,43 @@ class NativeApiTests(unittest.TestCase):
                         meta="{}", coll=coll))
                 finally:
                     plugin._ollama_embed_single = original_embed
+            finally:
+                del coll
+
+    def test_native_selective_fact_write(self):
+        """Real Zvec 0.6.0 insert, duplicate check, and fact role."""
+        try:
+            import zvec
+        except ImportError:
+            self.skipTest("requires zvec==0.6.0")
+        with tempfile.TemporaryDirectory() as tmp:
+            coll = zvec.create_and_open(
+                str(Path(tmp) / "facts"),
+                plugin._build_memories_schema(vector_dim=3, collection_name="facts"))
+            try:
+                p = object.__new__(plugin.ZvecMemoryProvider)
+                p._config = {"memory_write_mode": "facts", "min_content_len": 50,
+                             "enable_hnsw_optimize": False}
+                p._insert_lock, p._embedding_lock = threading.Lock(), threading.Lock()
+                p._writes_since_optimize = 0
+                old_embed, old_extract = plugin._ollama_embed_single, plugin._ollama_extract_fact
+                try:
+                    plugin._ollama_embed_single = lambda *args: np.ones(3, dtype=np.float32)
+                    plugin._ollama_extract_fact = lambda *args, **kw: (
+                        "Silver Badger runs CockroachDB and RabbitMQ on five Kubernetes nodes.")
+                    u = "Silver Badger uses CockroachDB and RabbitMQ on five Kubernetes nodes."
+                    self.assertTrue(p._write_turn_once(
+                        user_content=u, assistant_content="Sure.",
+                        sid="test-session", ts=1000.0, meta="{}", role="turn", coll=coll))
+                    self.assertFalse(p._write_turn_once(
+                        user_content=u, assistant_content="Different reply",
+                        sid="test-session", ts=1001.0, meta="{}", role="session_end", coll=coll))
+                    key = plugin._fact_doc_id("test-session", u)
+                    self.assertEqual(len(key), 64)
+                    self.assertIn(key, coll.fetch(ids=key, include_vector=False))
+                    self.assertEqual(coll.fetch(ids=key)[key].fields["role"], "fact")
+                finally:
+                    plugin._ollama_embed_single, plugin._ollama_extract_fact = old_embed, old_extract
             finally:
                 del coll
 

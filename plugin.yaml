@@ -72,3 +72,23 @@ config_schema:
     type: boolean
     default: true
     description: "Call collection.optimize() after large bulk inserts (merges flat buffer into HNSW graph)"
+  memory_write_mode:
+    type: string
+    default: "turns"
+    description: "Automatic memory write mode: turns (tested legacy behavior) or facts (Ollama selective extraction)"
+  extraction_model:
+    type: string
+    default: "qwen3.5:9b"
+    description: "Ollama generation model, used only when memory_write_mode=facts"
+  extraction_timeout_s:
+    type: number
+    default: 45
+    description: "Maximum seconds to wait for local fact extraction"
+  prefetch_mode:
+    type: string
+    default: "hybrid"
+    description: "Automatic recall mode: hybrid (keyword+vector) or vector"
+  prefetch_top_k:
+    type: integer
+    default: 5
+    description: "Number of memories injected into the prompt (1-10)"
