@@ -166,11 +166,11 @@ atexit.register(_drain_pending_writes)
 # release would thrash open/close on rapid back-and-forth turns — 30s is the
 # sweet spot. HERMES_MEMORY_ZVEC_IDLE_RELEASE_S=0 disables.
 # ---------------------------------------------------------------------------
-_IDLE_RELEASE_S = float(os.environ.get("HERMES_MEMORY_ZVEC_IDLE_RELEASE_S", "30"))
+_IDLE_RELEASE_S = float(os.environ.get("HERMES_MEMORY_ZVEC_IDLE_RELEASE_S", "5"))
 _IDLE_WATCHDOG_INTERVAL_S = (
     min(5.0, max(1.0, _IDLE_RELEASE_S / 3.0)) if _IDLE_RELEASE_S > 0 else 15.0
 )
-_REOPEN_RETRY_INTERVAL_S = 30.0
+_REOPEN_RETRY_INTERVAL_S = 5.0
 _PROVIDER_REGISTRY = weakref.WeakSet()
 _PROVIDER_REGISTRY_LOCK = threading.Lock()
 _IDLE_WATCHDOG_THREAD: Optional[threading.Thread] = None
@@ -694,7 +694,7 @@ class ZvecMemoryProvider(MemoryProvider):
         self._last_skip_warn = now
         logger.warning(
             "Zvec: collection unavailable — per-turn writes skipped (1/5min); "
-            "the session-end batch will re-store the full transcript",
+            "session-end recovery may only restore a bounded number of recent turns",
         )
 
     def _acquire_collection(self, *, max_drain_s: Optional[float] = None,
@@ -968,19 +968,50 @@ class ZvecMemoryProvider(MemoryProvider):
             kept = dict(list(kept.items())[-128:])  # keep most recent inserts
         self._prefetch_cache = kept
 
+    @staticmethod
+    def _rank_prefetch_candidates(candidates: List[Dict[str, Any]],
+                                  top_k: int) -> List[Dict[str, Any]]:
+        """Reserve up to two recall slots for durable facts; deduplicate transcripts."""
+        facts = [r for r in candidates if r.get("role") == "fact"]
+        rest = [r for r in candidates if r.get("role") != "fact"]
+        n_facts = min(2, top_k, len(facts))
+        ordered = facts[:n_facts] + rest + facts[n_facts:]
+        chosen: List[Dict[str, Any]] = []
+        seen = set()
+        for r in ordered:
+            identity = (r.get("content") or "").strip()
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            chosen.append(r)
+            if len(chosen) >= top_k:
+                break
+        return chosen
+
     def _prefetch_results(self, query: str) -> List[Dict[str, Any]]:
-        """Cross-session automatic recall: hybrid, falling back to vectors."""
+        """Cross-session recall: one broad retrieval, fact-aware context selection."""
         top_k = max(1, min(10, int(self._config.get("prefetch_top_k", 5))))
+        candidate_k = max(50, top_k * 10)
         mode = self._config.get("prefetch_mode", "hybrid")
         if mode == "vector":
-            return self._do_search(query, top_k=top_k, session_id="")
-        try:
-            results = self._do_hybrid_search(query, top_k=top_k, session_id="")
-            if results:
-                return results
-        except Exception as exc:
-            logger.warning("Zvec automatic hybrid prefetch failed: %s", exc)
-        return self._do_search(query, top_k=top_k, session_id="")
+            results = self._do_search(query, top_k=candidate_k, session_id="")
+        else:
+            try:
+                results = self._do_hybrid_search(
+                    query, top_k=candidate_k, session_id="")
+            except Exception as exc:
+                logger.warning("Zvec automatic hybrid prefetch failed: %s", exc)
+                results = []
+            if not results:
+                results = self._do_search(
+                    query, top_k=candidate_k, session_id="")
+        selected = self._rank_prefetch_candidates(results, top_k)
+        logger.debug(
+            "Zvec auto-prefetch selected %d/%d candidate(s), facts=%d",
+            len(selected), len(results),
+            sum(1 for item in selected if item.get("role") == "fact"),
+        )
+        return selected
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Synchronous cross-session recall with configurable ranking and count."""
@@ -998,7 +1029,7 @@ class ZvecMemoryProvider(MemoryProvider):
             self._cache_prefetch(cache_key, results)
             return self._format_results(results)
         except Exception as e:
-            logger.debug("prefetch search failed: %s", e)
+            logger.warning("Zvec automatic prefetch search failed: %s", e)
             return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -1379,13 +1410,12 @@ class ZvecMemoryProvider(MemoryProvider):
         otherwise ``sort(reverse=True)`` surfaces the LEAST relevant memories
         first and ``min_score`` keeps the worst ones.
         """
+        coll = self._coll  # pin across slow Ollama embedding, even if idle watchdog fires
+        if coll is None:
+            return []
         query_vec = self._embed_query(query)
         q = query_vec.tolist()
         zvec = _get_zvec()
-
-        coll = self._coll
-        if coll is None:
-            return []
         where = _build_filter(session_id, after_timestamp, before_timestamp)
 
         try:
@@ -1500,6 +1530,9 @@ class ZvecMemoryProvider(MemoryProvider):
         if fts_weight is None:
             fts_weight = self.fts_weight
 
+        coll = self._coll  # pin across slow Ollama embedding, even if idle watchdog fires
+        if coll is None:
+            return []
         query_vec = self._embed_query(query)
         q = query_vec.tolist()
         zvec = _get_zvec()
@@ -1522,9 +1555,6 @@ class ZvecMemoryProvider(MemoryProvider):
             if where:
                 kwargs["filter"] = where
 
-            coll = self._coll
-            if coll is None:
-                return []
             results = coll.query(**kwargs)
         except Exception as native_err:
             logger.warning(

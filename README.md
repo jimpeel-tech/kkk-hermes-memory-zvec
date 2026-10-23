@@ -189,3 +189,18 @@ in selective mode. To retain every turn reliably, keep `turns` mode.
 The provider's memory status and tool descriptions use the configured
 embedding model and dimensionality; you can keep `nomic-embed-text` with
 `vector_dim: 768` while using `qwen3.5:9b` for fact extraction.
+
+### Windows locking and automatic fact retrieval
+
+Zvec 0.6.0 locks a collection exclusively even for read-only opens. Running
+multiple Hermes processes against the same Zvec directory can cause skipped
+memory reads and writes. The idle handle grace period defaults to 5 seconds
+instead of 30, reducing (but **not eliminating**) contention. Override it
+with `HERMES_MEMORY_ZVEC_IDLE_RELEASE_S` before Hermes starts. Do not
+delete a live Zvec LOCK file. Prefer one Hermes owner process per database.
+
+Automatic prefetch retrieves up to 50 candidates with a single embedding
+request and reserves up to two of five context slots for explicit extracted
+facts, deduplicating identical old transcript rows. Manual
+`vec_memory_search` remains unchanged. Preference recall is not guaranteed
+if the fact is absent from the candidate pool.

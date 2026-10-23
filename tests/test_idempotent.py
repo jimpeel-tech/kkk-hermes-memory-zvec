@@ -258,7 +258,36 @@ class SelectiveFactsTests(unittest.TestCase):
         self.p._do_search = vector
         result = self.p.prefetch("Silver Badger?", session_id="new-session")
         self.assertIn("Silver Badger", result)
-        self.assertEqual(seen, [("hybrid", 5, ""), ("vector", 5, "")])
+        self.assertEqual(seen, [("hybrid", 50, ""), ("vector", 50, "")])
+
+    def test_prefetch_promotes_fact_below_top_five(self):
+        self.p._config["prefetch_top_k"] = 5
+        candidates = [
+            {"content": f"Old generic troubleshooting transcript {i}", "role": "turn",
+             "score": 0.032 - i * 0.001}
+            for i in range(8)
+        ]
+        candidates.append({
+            "content": "For Hermes, prefers Markdown tables then short PowerShell commands.",
+            "role": "fact", "score": 0.019,
+        })
+        self.p._do_hybrid_search = lambda q, top_k, session_id: candidates
+        results = self.p._prefetch_results(
+            "When helping me troubleshoot Hermes, how should you format your answers?")
+        self.assertEqual(len(results), 5)
+        self.assertEqual(results[0]["role"], "fact")
+        self.assertIn("Markdown tables", results[0]["content"])
+
+    def test_prefetch_deduplicates_old_turns(self):
+        results = [
+            {"content": "User discussed a disk outage", "role": "turn"},
+            {"content": "User discussed a disk outage", "role": "session_end"},
+            {"content": "Prefers Fish syntax", "role": "fact"},
+            {"content": "Unrelated detail", "role": "turn"},
+        ]
+        selected = self.p._rank_prefetch_candidates(results, 4)
+        self.assertEqual([r["content"] for r in selected],
+                         ["Prefers Fish syntax", "User discussed a disk outage", "Unrelated detail"])
 
 
 class NativeApiTests(unittest.TestCase):
