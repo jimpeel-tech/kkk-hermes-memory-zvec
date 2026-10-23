@@ -879,7 +879,7 @@ class ZvecMemoryProvider(MemoryProvider):
                 return self._format_results(results[:3])
             del self._prefetch_cache[cache_key]
         try:
-            results = self._do_search(query, top_k=3, session_id=session_id)
+            results = self._do_search(query, top_k=3, session_id="")
             self._cache_prefetch(cache_key, results)
             return self._format_results(results)
         except Exception as e:
@@ -895,7 +895,7 @@ class ZvecMemoryProvider(MemoryProvider):
         def _bg():
             try:
                 self._ensure_open()  # entry-time handle may have been idle-released meanwhile
-                results = self._do_search(query, top_k=3, session_id=session_id)
+                results = self._do_search(query, top_k=3, session_id="")
                 self._cache_prefetch(query[:200], results)
             except Exception:
                 pass
