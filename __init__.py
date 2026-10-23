@@ -45,6 +45,7 @@ Community port by kuntao2011. MIT licensed. Tested with Zvec 0.6.0 / Python 3.11
 from __future__ import annotations
 
 import atexit
+import hashlib
 import contextvars
 import json
 import logging
@@ -247,6 +248,27 @@ def _ollama_embed(texts: List[str], base_url: str, model: str) -> List[np.ndarra
 def _ollama_embed_single(text: str, base_url: str, model: str) -> np.ndarray:
     """Embed a single text."""
     return _ollama_embed([text], base_url, model)[0]
+
+
+
+def _canonical_turn(user_content, assistant_content):
+    """Normalize both lifecycle hooks identically without changing inner whitespace."""
+    def normalize(value):
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            value = str(value)
+        return value.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    user = normalize(user_content)
+    assistant = normalize(assistant_content)
+    return user, assistant, f"[user]\n{user}\n[assistant]\n{assistant}"
+
+
+def _turn_doc_id(session_id, user, assistant):
+    """Deterministic, versioned ID scoped to session and canonical turn content."""
+    payload = json.dumps([session_id, user, assistant], ensure_ascii=False, separators=(",", ":"))
+    return "turn-v1-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ============================================================================
@@ -903,6 +925,53 @@ class ZvecMemoryProvider(MemoryProvider):
         t = _spawn_thread(target=_bg, daemon=True, name="zvec-prefetch")
         t.start()
 
+    def _write_turn_once(
+        self, *, user_content, assistant_content, sid, ts, meta, role, coll,
+        retry_embed=False,
+    ) -> bool:
+        """Idempotent completed-turn write shared by turn sync and session recovery.
+
+        Both hooks use identical IDs. The insert lock covers fetch, embedding,
+        insert and flush so concurrent writers never duplicate or re-embed an
+        existing row. Caller pins coll across daemon-thread/shutdown races.
+        """
+        user, assistant, combined = _canonical_turn(user_content, assistant_content)
+        if len(combined) < int(self._config.get("min_content_len", 50)):
+            return False
+        doc_id = _turn_doc_id(sid, user, assistant)
+        with self._insert_lock:
+            if doc_id in coll.fetch(ids=doc_id, include_vector=False):
+                return False
+            try:
+                with self._embedding_lock:
+                    vec = _ollama_embed_single(combined, self.base_url, self.model)
+            except Exception as e:
+                if not retry_embed:
+                    raise
+                logger.warning("session-end embed retry: %s", e)
+                time.sleep(1.0)
+                with self._embedding_lock:
+                    vec = _ollama_embed_single(combined, self.base_url, self.model)
+            doc = self._make_doc(
+                id_value=doc_id, content=combined, role=role, sid=sid,
+                ts=ts, vec=vec, meta=meta,
+            )
+            status = coll.insert(doc)
+            if not status.ok():
+                if status.code() == _get_zvec().StatusCode.ALREADY_EXISTS:
+                    return False
+                raise RuntimeError(f"Zvec insert failed ({status.code()}): {status.message()}")
+            coll.flush()
+            self._writes_since_optimize += 1
+            if (self._writes_since_optimize >= _OPTIMIZE_EVERY_N_WRITES
+                    and self._config.get("enable_hnsw_optimize", True)):
+                try:
+                    coll.optimize()
+                    self._writes_since_optimize = 0
+                except Exception as e:
+                    logger.debug("amortized optimize failed: %s", e)
+            return True
+
     # -- Write hooks ---------------------------------------------------------
 
     def sync_turn(self, user_content: str, assistant_content: str, *,
@@ -933,16 +1002,11 @@ class ZvecMemoryProvider(MemoryProvider):
 
         def _store():
             try:
-                combined = f"[user]\n{user_content}\n[assistant]\n{assistant_content}"
-                if len(combined) < int(self._config.get("min_content_len", 50)):
-                    return
-                with self._embedding_lock:
-                    vec = _ollama_embed_single(combined, self.base_url, self.model)
-                self._insert(combined=combined, role="turn", sid=sid,
-                             ts=ts, vec=vec, meta=meta, coll=coll)
+                self._write_turn_once(
+                    user_content=user_content, assistant_content=assistant_content,
+                    sid=sid, ts=ts, meta=meta, role="turn", coll=coll,
+                )
             except Exception as e:
-                # Was logger.debug: an Ollama outage or a bad embed silently lost
-                # every turn with zero operator-visible signal. Surface it.
                 logger.warning("sync_turn store failed (turn NOT remembered): %s", e)
             finally:
                 _untrack_write_thread(threading.current_thread())
@@ -997,90 +1061,49 @@ class ZvecMemoryProvider(MemoryProvider):
         if not pairs:
             return
 
-        def _embed_with_retry(text: str, retries: int = 1, backoff: float = 1.0) -> Optional[np.ndarray]:
-            """Embed a single text with one retry on transient failure."""
-            try:
-                return _ollama_embed_single(text, self.base_url, self.model)
-            except Exception as first_err:
-                logger.warning(
-                    "session_end embed failed (will retry in %.1fs): %s",
-                    backoff, first_err,
-                )
-                import time as _time
-                _time.sleep(backoff)
-                try:
-                    return _ollama_embed_single(text, self.base_url, self.model)
-                except Exception as retry_err:
-                    logger.warning("session_end embed retry also failed: %s", retry_err)
-                    return None
-
         def _batch_store():
             try:
-                min_len = int(self._config.get("min_content_len", 50))
+                stored = skipped = 0
                 now_ts = datetime.now().timestamp()
-                stored = 0
-                skipped = 0
-                with self._insert_lock:
-                    for pair in pairs:
-                        u = pair["user_content"]
-                        a = pair["asst_content"]
-                        u_ts = pair["user_ts"]
-                        a_ts = pair["asst_ts"]
-                        combined = f"[user]\n{u}\n[assistant]\n{a}"
-
-                        ts_list = []
-                        if u_ts:
+                for pair in pairs:
+                    u, a = pair["user_content"], pair["asst_content"]
+                    u_ts, a_ts = pair["user_ts"], pair["asst_ts"]
+                    ts_list = []
+                    for value in (u_ts, a_ts):
+                        if value:
                             try:
-                                ts_list.append(datetime.fromtimestamp(float(u_ts)).isoformat())
-                            except Exception:
+                                ts_list.append(datetime.fromtimestamp(float(value)).isoformat())
+                            except (ValueError, TypeError, OverflowError):
                                 pass
-                        if a_ts:
-                            try:
-                                ts_list.append(datetime.fromtimestamp(float(a_ts)).isoformat())
-                            except Exception:
-                                pass
-
-                        meta = {
-                            "user_preview": u[:100],
-                            "asst_preview": a[:100] if a else "",
-                            "message_timestamps": ts_list,
-                        }
-                        row_ts = u_ts if isinstance(u_ts, (int, float)) and u_ts > 0 else now_ts
-
-                        if len(combined) < min_len:
+                    meta = json.dumps({
+                        "user_preview": u[:100],
+                        "asst_preview": a[:100] if isinstance(a, str) else "",
+                        "message_timestamps": ts_list,
+                    }, ensure_ascii=False)
+                    row_ts = u_ts if isinstance(u_ts, (int, float)) and u_ts > 0 else now_ts
+                    try:
+                        if self._write_turn_once(
+                            user_content=u, assistant_content=a, sid=sid,
+                            ts=row_ts, meta=meta, role="session_end", coll=coll,
+                            retry_embed=True,
+                        ):
+                            stored += 1
+                        else:
                             skipped += 1
-                            continue
+                    except Exception as e:
+                        skipped += 1
+                        logger.warning("session-end turn store failed: %s", e)
 
-                        vec = _embed_with_retry(combined)
-                        if vec is None:
-                            skipped += 1
-                            continue
-
-                        doc = self._make_doc(
-                            id_value=str(uuid.uuid4()),
-                            content=combined,
-                            role="session_end",
-                            sid=sid,
-                            ts=row_ts,
-                            vec=vec,
-                            meta=json.dumps(meta, ensure_ascii=False),
-                        )
-                        coll.insert(doc)
-                        coll.flush()
-                        stored += 1
-
-                    # Optimize HNSW once after all inserts
-                    if stored > 0 and self._config.get("enable_hnsw_optimize", True):
+                if stored and self._config.get("enable_hnsw_optimize", True):
+                    with self._insert_lock:
                         try:
                             coll.optimize()
-                        except Exception:
-                            pass
-
+                            self._writes_since_optimize = 0
+                        except Exception as e:
+                            logger.debug("session-end optimize failed: %s", e)
                 if stored or skipped:
-                    logger.info(
-                        "Zvec: session-end stored=%d, skipped=%d (short/embed-fail)",
-                        stored, skipped,
-                    )
+                    logger.info("Zvec: session-end stored=%d skipped=%d (duplicate/short/error)",
+                                stored, skipped)
             except Exception as e:
                 logger.warning("session_end batch store failed: %s", e)
             finally:
@@ -1179,7 +1202,9 @@ class ZvecMemoryProvider(MemoryProvider):
         doc = self._make_doc(id_value=mem_id, content=combined, role=role, sid=sid,
                              ts=ts, vec=vec, meta=meta)
         with self._insert_lock:
-            target.insert(doc)
+            status = target.insert(doc)
+            if not status.ok():
+                raise RuntimeError(f"Zvec insert failed ({status.code()}): {status.message()}")
             target.flush()
             # Amortized HNSW maintenance: without this, vectors sit in the flat
             # buffer and index_completeness only recovers on on_session_end.
