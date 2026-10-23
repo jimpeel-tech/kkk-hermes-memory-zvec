@@ -92,3 +92,7 @@ config_schema:
     type: integer
     default: 5
     description: "Number of memories injected into the prompt (1-10)"
+  facts_session_end_max_turns:
+    type: integer
+    default: 2
+    description: "In selective mode retry at most this many recent turns on session end (0-10)"

@@ -137,7 +137,7 @@ plugin architecture and to the Zvec team for the storage engine.
 
 This fork preserves the original full-turn behavior by default. To **opt in**
 to selective long-term facts, add the following keys under the existing
-\`plugins.memory-zvec\` section in \`$HERMES_HOME/config.yaml\`:
+`plugins.memory-zvec` section in `$HERMES_HOME/config.yaml`:
 
 ```yaml
 plugins:
@@ -149,31 +149,43 @@ plugins:
     prefetch_top_k: 5
 ```
 
-Keep the existing \`base_url\`, \`embedding_model\`, \`vector_dim\`, \`zvec_dir\`
-and \`collection_name\` values. Do NOT replace the entire config section.
+Keep the existing `base_url`, `embedding_model`, `vector_dim`, `zvec_dir`
+and `collection_name` values. Do NOT replace the entire config section.
 
 **Selective mode:** Each automatic sync/recovery hook submits the user's
-message (not the assistant response) to local Ollama \`/api/generate\` with
+message (not the assistant response) to local Ollama `/api/generate` with
 JSON-only extraction instructions. It stores **one concise, user-sourced
-fact** as role \`fact\` per source turn, or stores nothing when there is no
+fact** as role `fact` per source turn, or stores nothing when there is no
 durable fact. Fictional examples, unsupported assistant guesses, and
 questions should be skipped. A deterministic 64-character SHA256 document
-ID prevents duplicate writes across \`sync_turn\` and \`on_session_end\`.
+ID prevents duplicate writes across `sync_turn` and `on_session_end`.
 No remote extraction API is used. You must already have the configured
-generation model available in Ollama (\`ollama list\`).
+generation model available in Ollama (`ollama list`).
 
 Extraction is imperfect because it is model-driven. Inspect saved facts
 for accuracy and **avoid storing secrets or sensitive data**. The system
 prompt instructs exclusion but is not a security boundary. On an Ollama
 error, selective mode logs a warning and retries at session end; it **does
 not** save the raw conversation as a hidden fallback. For guaranteed
-transcript retention, use \`memory_write_mode: turns\`.
+transcript retention, use `memory_write_mode: turns`.
 
-**Recall:** Automatic prefetch defaults to cross-session \`hybrid\` mode
+**Recall:** Automatic prefetch defaults to cross-session `hybrid` mode
 (semantic vector + full-text), up to five results, with vector-only
-fallback if hybrid yields no results. Override \`prefetch_mode: vector\`
+fallback if hybrid yields no results. Override `prefetch_mode: vector`
 to restore previous ranking. Existing Zvec records are left unchanged;
 switching modes does not migrate or delete existing memory.
 
 The native test suite runs with real Zvec 0.6.0 in isolated temporary
 collections. No test connects to your production database or local Ollama.
+
+
+**Session end:** In selective mode only the two most recent turns are retried
+by default (`facts_session_end_max_turns: 2`, 0 to 10). Normal `sync_turn`
+processes each turn as it happens. This avoids repeatedly running a large
+local generation model over an entire chat when you close the session.
+Long conversations where `sync_turn` was unavailable may lose older facts
+in selective mode. To retain every turn reliably, keep `turns` mode.
+
+The provider's memory status and tool descriptions use the configured
+embedding model and dimensionality; you can keep `nomic-embed-text` with
+`vector_dim: 768` while using `qwen3.5:9b` for fact extraction.

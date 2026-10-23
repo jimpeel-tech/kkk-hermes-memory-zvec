@@ -410,7 +410,7 @@ MEMORY_STORE_SCHEMA = {
         "Store a piece of information in vector memory for semantic retrieval. "
         "Use to remember facts, decisions, preferences, commands, or any content "
         "you want to recall later via natural-language queries.\n\n"
-        "The content is embedded with bge-m3:latest into a 1024-dim vector and "
+        "The content is embedded with the configured Ollama model and "
         "stored in Zvec with HNSW + FTS index. Retrieval uses native hybrid query "
         "(vector + scalar filter + FTS fused via RRFReRanker).\n\n"
         "Use vec_memory_search to retrieve, vec_memory_list to view stored items."
@@ -431,7 +431,7 @@ MEMORY_SEARCH_SCHEMA = {
     "name": "vec_memory_search",
     "description": (
         "Semantic search over stored vector memory using natural-language query. "
-        "Converts the query to a vector with bge-m3:latest and returns the most "
+        "Converts the query to a vector with the configured model and returns the most "
         "similar stored items via hybrid search (vector + scalar filter + FTS fused "
         "via RRFReRanker). Use for recalling facts, decisions, preferences, and any "
         "stored context from previous sessions.\n\n"
@@ -646,6 +646,7 @@ class ZvecMemoryProvider(MemoryProvider):
             {"key": "extraction_timeout_s","description": "Ollama extraction request timeout in seconds", "default": "45"},
             {"key": "prefetch_mode",       "description": "Automatic retrieval: hybrid or vector", "default": "hybrid"},
             {"key": "prefetch_top_k",      "description": "Maximum memories injected by automatic prefetch", "default": "5"},
+            {"key": "facts_session_end_max_turns", "description": "Maximum recent turns retried at session end in facts mode", "default": "2"},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -901,8 +902,8 @@ class ZvecMemoryProvider(MemoryProvider):
             )
         return (
             f"# Ollama Vector Memory\n"
-            f"Active (Zvec backend). {total} items stored with bge-m3:latest embeddings "
-            f"(1024-dim) via Zvec HNSW + FTS.\n"
+            f"Active (Zvec backend). {total} items stored with {self.model} embeddings "
+            f"({self.vector_dim}-dim) via Zvec HNSW + FTS.\n"
             f"Hybrid search fuses vector + scalar filter + FTS via RRFReRanker.\n"
             f"Use vec_memory_add to store, vec_memory_search to retrieve, "
             f"vec_memory_list to browse, vec_memory_stats for overview."
@@ -1179,6 +1180,16 @@ class ZvecMemoryProvider(MemoryProvider):
                 })
         if not pairs:
             return
+
+        # Selective extraction needs a generation-model call per new turn.
+        # Keep session-end recovery bounded; routine sync_turn already handles
+        # every turn, and draining a long chat at close would take minutes.
+        if self._config.get("memory_write_mode", "turns") == "facts":
+            recovery_turns = max(
+                0, min(10, int(self._config.get("facts_session_end_max_turns", 2))))
+            if not recovery_turns:
+                return
+            pairs = pairs[-recovery_turns:]
 
         def _batch_store():
             try:

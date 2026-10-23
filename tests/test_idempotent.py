@@ -229,6 +229,18 @@ class SelectiveFactsTests(unittest.TestCase):
         finally:
             plugin.requests.post = old_post
 
+    def test_session_end_selective_extraction_is_bounded(self):
+        self.p._config["facts_session_end_max_turns"] = 2
+        messages = []
+        for index in range(7):
+            messages.extend([
+                {"role": "user", "content": f"I use a tool on Project {index} and decided to keep it."},
+                {"role": "assistant", "content": "Understood, noted."},
+            ])
+        self.p.on_session_end(messages)
+        plugin._drain_pending_writes(timeout=5)
+        self.assertEqual((len(self.coll.docs), self.extractions), (2, 2))
+
     def test_prefetch_hybrid_and_vector_fallback(self):
         self.p._config["prefetch_top_k"] = 5
         seen = []
